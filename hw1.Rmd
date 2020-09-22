@@ -1,0 +1,21 @@
+---
+title: "CEE218X Assignment #1"
+author: "Corinne Bowers"
+date: `r lubridate::today()`
+output: html_document
+---
+
+```{r setup, include = FALSE}
+root <- 'C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/GitHub/CEE218X/'
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = root)
+
+```
+
+```{r packages, message = FALSE, warning = FALSE}
+require(ggplot2); theme_set(theme_classic())
+require(dplyr)
+require(lubridate)
+
+```
