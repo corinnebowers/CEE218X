@@ -1,26 +1,152 @@
 ---
 title: "CEE218X Assignment #1"
 author: "Corinne Bowers"
-date: "2020-09-22"
+date: `r format(Sys.Date(), '%B %d, %Y')`
 output: html_document
 ---
 
 ```{r setup, include = FALSE}
-# root <- 'C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/cee218x/'
-
 knitr::opts_chunk$set(echo = TRUE)
-# knitr::opts_knit$set(root.dir = root)
 
 ```
 
 ```{r packages, message = FALSE, warning = FALSE}
-require(ggplot2); theme_set(theme_classic())
-require(dplyr)
+require(tidyverse); theme_set(theme_bw())
+require(foreach)
+require(plotly)
+require(sf)
+require(tigris)
+require(leaflet)
 require(lubridate)
 
 ```
 
+```{r functions}
+Sum <- function(x) sum(x, na.rm = TRUE)
+toNumber <- function(x) as.numeric(paste(x))
+
+```
+
+```{r constants}
+crs_planar <- 26910 
+crs_leaflet <- 4326
+
+```
+
 ```{r}
-rnorm(10)
+## load data from PG&E website
+
+col_types_elec <- cols(
+  ZIPCODE = col_double(),
+  MONTH = col_double(),
+  YEAR = col_double(),
+  CUSTOMERCLASS = col_character(),
+  COMBINED = col_character(),
+  TOTALCUSTOMERS = col_number(),
+  TOTALKWH = col_number(),
+  AVERAGEKWH = col_number()
+)
+elec <- 
+  foreach (file = list.files('./PGE_ElectricUsageByZip'), 
+           .combine = 'rbind') %do% {
+    read_csv(paste0('./PGE_ElectricUsageByZip/', file), col_types = col_types_elec)
+  }
+
+col_types_gas <- cols(
+  ZIPCODE = col_double(),
+  MONTH = col_double(),
+  YEAR = col_double(),
+  CUSTOMERCLASS = col_character(),
+  COMBINED = col_character(),
+  TOTALCUSTOMERS = col_number(),
+  TOTALTHM = col_number(),
+  AVERAGETHM = col_number()
+)
+gas <- 
+  foreach (file = list.files('./PGE_GasUsageByZip'), 
+           .combine = 'rbind') %do% {
+    read_csv(paste0('./PGE_GasUsageByZip/', file), col_types = col_types_gas)
+  }
+
+```
+
+
+```{r}
+## start data analysis
+bay_county_names <- c("Alameda", "Contra Costa", "Marin", "Napa", "San Francisco",
+                      "San Mateo", "Santa Clara", "Solano", "Sonoma")
+
+california <- counties(state = 'CA', cb = TRUE, progress_bar = FALSE, class = 'sf')
+bay_counties <- california %>% filter(NAME %in% bay_county_names)
+
+usa_zips <- zctas(cb = TRUE, progress_bar = FALSE, class = 'sf')
+bay_zips <- usa_zips %>% 
+  st_centroid %>% 
+  st_intersection(bay_counties) %>% 
+  st_drop_geometry %>% 
+  left_join(usa_zips %>% select(GEOID10)) %>% 
+  st_as_sf() 
+bay_zips$ZCTA5CE10 <- toNumber(bay_zips$ZCTA5CE10)
+
+## clean up elec & gas
+kwh_kbtu <- 3412.14
+therm_kbtu <- 99976.1
+
+elec <- elec %>% 
+  subset(ZIPCODE %in% bay_zips$ZCTA5CE10) %>% 
+  mutate(CUSTOMERCLASS = gsub('Elec- ', '', CUSTOMERCLASS)) %>%
+  subset(CUSTOMERCLASS %in% c('Commercial', 'Residential')) %>% 
+  mutate(TOTALKBTU = TOTALKWH*kwh_kbtu) %>%    
+         # AVGKBTU = AVERAGEKWH*kwh_kbtu
+  select(-TOTALKWH, -AVERAGEKWH)
+gas <- gas %>% 
+  subset(ZIPCODE %in% bay_zips$ZCTA5CE10) %>% 
+  mutate(CUSTOMERCLASS = gsub('Gas- ', '', CUSTOMERCLASS)) %>%
+  mutate(TOTALKBTU = TOTALTHM*therm_kbtu) %>% 
+         # AVGKBTU = AVERAGETHM*therm_kbtu
+  select(-TOTALTHM, -AVERAGETHM)
+
+kbtu <- full_join(elec, gas, by = c('ZIPCODE', 'MONTH', 'YEAR', 'CUSTOMERCLASS'), suffix = c('_ELEC', '_GAS'))
+
+## add spatial data
+kbtu.sf <- kbtu %>%
+  full_join(bay_zips, ., by = c('ZCTA5CE10' = 'ZIPCODE'))
+
+temp <- kbtu.sf %>% 
+  group_by(NAME, MONTH, YEAR) %>% 
+  summarize(avg_elec = Sum(TOTALKBTU_ELEC) / Sum(TOTALCUSTOMERS_ELEC),
+            avg_gas = Sum(TOTALKBTU_GAS) / Sum(TOTALCUSTOMERS_GAS)) %>% 
+  mutate(date = ymd(paste(YEAR, MONTH, '1', sep = '-')))
+ggplot(temp) + 
+  geom_line(aes(x = date, y = avg_elec, group = NAME, color = NAME)) + 
+  ggtitle('Average Electricity Consumption by County')
+ggplot(temp) + 
+  geom_line(aes(x = date, y = avg_gas, group = NAME, color = NAME)) + 
+  ggtitle('Average Gas Consumption by County')
+
+temp <- kbtu.sf %>% 
+  group_by(CUSTOMERCLASS, MONTH, YEAR) %>% 
+  summarize(total_elec = Sum(TOTALKBTU_ELEC),
+            avg_elec = total_elec / Sum(TOTALCUSTOMERS_ELEC),
+            total_gas = Sum(TOTALKBTU_GAS),
+            avg_gas = total_gas / Sum(TOTALCUSTOMERS_GAS)) %>% 
+  mutate(date = ymd(paste(YEAR, MONTH, '1', sep = '-')))
+ggplot(temp) + 
+  geom_line(aes(x = date, y = avg_elec, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'elec')) + 
+  geom_line(aes(x = date, y = avg_gas, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'gas')) + 
+  ggtitle('Average Consumption (KBTUs)', subtitle = 'Separated by Customer Type and Consumption Type')
+
+ggplot(temp %>% subset(YEAR >= 2019)) + 
+  geom_line(aes(x = date, y = avg_elec, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'elec')) + 
+  geom_line(aes(x = date, y = avg_gas, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'gas')) + 
+  ggtitle('Average Consumption (KBTUs)', subtitle = 'Separated by Customer Type and Consumption Type') + 
+  labs(color = 'Customer Type', linetype = 'Consumption Type', y = 'Energy Consumption (KBTUs)') + 
+  scale_x_date(date_breaks = 'months', date_minor_breaks = 'months', date_labels = '%b %g') + 
+  theme(axis.title.x = element_blank())
+
+
+?scale_x_date
+View(st_drop_geometry(kbtu.sf))
+
 ```
 
