@@ -1,15 +1,15 @@
 ---
 title: "CEE218X Assignment #1"
 author: "Corinne Bowers"
-date: `r lubridate::today()`
+date: "2020-09-22"
 output: html_document
 ---
 
 ```{r setup, include = FALSE}
-root <- 'C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/GitHub/CEE218X/'
+# root <- 'C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/cee218x/'
 
 knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(root.dir = root)
+# knitr::opts_knit$set(root.dir = root)
 
 ```
 
@@ -19,3 +19,8 @@ require(dplyr)
 require(lubridate)
 
 ```
+
+```{r}
+rnorm(10)
+```
+
