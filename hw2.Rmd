@@ -1,0 +1,456 @@
+---
+title: 'CEE218X Assignment #2'
+author: "Corinne Bowers"
+date: "10/28/2020"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 10)
+
+```
+
+```{r message = FALSE, warning = FALSE}
+## load packages
+require(tidyverse); theme_set(theme_bw())
+require(foreach)
+require(sf)
+require(tigris)
+require(leaflet)
+require(lubridate)
+require(censusapi)
+require(tidycensus)
+require(scales)
+
+Sys.setenv(CENSUS_KEY = 'f2e090156b02ced027d4ed756f82c9a3a1aa38c9')
+census_api_key('f2e090156b02ced027d4ed756f82c9a3a1aa38c9')
+
+```
+
+```{r}
+## import useful functions
+Sum <- function(x) sum(x, na.rm = TRUE)
+Mean <- function(x) mean(x, na.rm = TRUE)
+
+toNumber <- function(x) as.numeric(paste(x))
+
+ggcolor <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+# acs_vars_2018_5yr <- listCensusMetadata(name = "2018/acs/acs5", type = "variables")
+# acs_vars_2019_1yr <- listCensusMetadata(name = "2019/acs/acs1", type = "variables")
+# save(acs_vars_2018_5yr, acs_vars_2019_1yr, 
+#      file = 'C:/Users/Corinne/OneDrive/classes/CEE218X future of the bay area/cee218x/acs_vars.Rdata')
+load('C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/cee218x/acs_vars.Rdata')
+
+```
+
+```{r}
+## load geometries
+crs_planar <- 26910 
+crs_leaflet <- 4326
+
+bay_county_names <- c("Alameda", "Contra Costa", "Marin", "Napa", "San Francisco",
+                      "San Mateo", "Santa Clara", "Solano", "Sonoma")
+
+california <- counties(state = 'CA', cb = TRUE, progress_bar = FALSE, class = 'sf')
+bay_counties <- california %>% filter(NAME %in% bay_county_names)
+
+# usa_zips <- zctas(cb = TRUE, progress_bar = FALSE, class = 'sf')
+# bay_zips <- usa_zips %>%
+#   st_centroid %>%
+#   st_transform(crs_planar) %>% 
+#   st_intersection(st_transform(bay_counties, crs_planar)) %>%
+#   st_drop_geometry %>%
+#   left_join(usa_zips %>% select(GEOID10)) %>%
+#   st_as_sf()
+# bay_zips$ZCTA5CE10 <- toNumber(bay_zips$ZCTA5CE10)
+
+```
+
+
+Prepare a report analyzing education outcomes in one County (of your choice) in the Bay Area. You are welcome to include as many data-driven insights as you’d like, with the many kinds of education datasets available from the Census Bureau and elsewhere, but at the minimum, you must include:
+
+1. An equity analysis of educational attainment by race. Plot the “stacked” and “filled” bar charts as demonstrated in 2.2; from there, you are welcome to add as many comments and supplementary visualizations as you’d like. Essentially, respond to the question: “Is there disproportionate education attainment by race in the County?” Note that the universe of the ACS datasets on educational attainment is “population 25 years or older”, so be sure to clarify that in your visuals and commentary.
+
+```{r}
+## get data
+census_race_labels <- 
+  c("White",
+    "Black or African American",
+    "American Indian and Alaska Native",
+    "Asian",
+    "Native Hawaiian and Other Pacific Islander",
+    "Some Other Race", 
+    "Two or More Races", 
+    "White Alone, Not Hispanic or Latino",
+    "Hispanic or Latino")
+
+sonoma_edbyrace <- 
+  foreach (i = 1:7, .combine = 'rbind') %do% {
+    getCensus(name = "acs/acs5", vintage = 2018, 
+              vars = paste0('group(C15002', LETTERS[i], ')'), 
+              regionin = "state:06", region = "county:097") %>% 
+      mutate(race_id = census_race_labels[i]) %>%
+      select(-c(GEO_ID, state, county, NAME)) %>% 
+      select(-ends_with('EA'), -ends_with('M'), -ends_with('MA')) %>%
+      pivot_longer(cols = ends_with('E'), names_to = 'variable', values_to = 'estimate') %>%
+      left_join(acs_vars_2018_5yr %>% select(name, label), by = c('variable' = 'name')) %>% 
+      select(-variable)
+  }
+sonoma_edbyrace <- sonoma_edbyrace %>% 
+  rename(race = race_id) %>%
+  separate(label, into = c(NA, NA, "sex", "education"), sep = "!!") %>% 
+  filter(!is.na(education)) %>% 
+  group_by(race, education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop')
+
+## check that estimates by race match expected totals
+sonoma_ed <- 
+  getCensus(name = "acs/acs5", vintage = 2018, vars = 'group(B15002)',
+            regionin = "state:06", region = "county:097") %>%
+  select(-c(GEO_ID, state, county, NAME)) %>% 
+  select(-ends_with('EA'), -ends_with('M'), -ends_with('MA')) %>%
+  pivot_longer(cols = ends_with('E'), names_to = 'variable', values_to = 'estimate') %>%
+  left_join(acs_vars_2018_5yr %>% select(name, label), by = c('variable' = 'name')) %>% 
+  select(-variable) %>% 
+  separate(label, into = c(NA, NA, "sex", "education"), sep = "!!") %>% 
+  filter(!is.na(education)) %>% 
+  group_by(education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop')
+  
+sum(sonoma_edbyrace$estimate) == sum(sonoma_ed$estimate)
+
+```
+
+```{r}
+## visualize data
+ggplot(sonoma_edbyrace) + 
+  geom_bar(aes(x = factor(education, levels = unique(education)[c(1,4,2,3)]), 
+               y = estimate, fill = factor(race, levels = census_race_labels[1:7])), 
+           stat = 'identity') + 
+  scale_y_continuous(labels = comma, name = 'Population Estimate', expand = c(0, 0),
+                     limits = c(0, 130000)) + 
+  scale_fill_brewer(palette = 'Oranges', name = 'Race') + 
+  ggtitle('Educational Attainment by Race in Sonoma County', 
+          subtitle = 'Population 25 Years and Older') + 
+  coord_flip() + 
+  theme(legend.position = 'bottom', legend.direction = 'vertical',
+        axis.title.y = element_blank(), 
+        plot.margin = margin(1, 10, 1, 1),
+        panel.border = element_blank(), panel.grid = element_blank(),
+        axis.line.x = element_line(color = 'black'))
+
+ggplot(sonoma_edbyrace) + 
+  geom_bar(aes(x = factor(education, levels = unique(education)[c(1,4,2,3)]), 
+               y = estimate, fill = factor(race, levels = census_race_labels[1:7])), 
+           stat = 'identity', position = 'fill') + 
+  scale_y_continuous(name = 'Population Proportion', expand = c(0, 0)) + 
+  scale_fill_brewer(palette = 'Oranges', name = 'Race') + 
+  ggtitle('Educational Attainment by Race in Sonoma County', 
+          subtitle = 'Population 25 Years and Older') + 
+  coord_flip() + 
+  theme(legend.position = 'bottom', legend.direction = 'vertical',
+        axis.title.y = element_blank(), 
+        plot.margin = margin(1, 10, 1, 1),
+        panel.border = element_blank(), panel.grid = element_blank(),
+        axis.line.x = element_line(color = 'black'))
+
+ggplot(sonoma_edbyrace) + 
+  geom_bar(aes(x = factor(race, levels = census_race_labels[7:1]), y = estimate, 
+               fill = factor(education, levels = unique(education)[c(1,4,2,3)])), 
+           stat = 'identity') + 
+  scale_y_continuous(labels = comma, name = 'Population Estimate', expand = c(0, 0),
+                     limits = c(0, 308000)) + 
+  scale_fill_brewer(palette = 'Purples', direction = 1, name = 'Educational Attainment',
+                    guide = guide_legend(reverse = TRUE)) + 
+  ggtitle('Race by Educational Attainment in Sonoma County', 
+          subtitle = 'Population 25 Years and Older') + 
+  coord_flip() + 
+  theme(legend.position = 'bottom', legend.direction = 'vertical',
+        axis.title.y = element_blank(),
+        plot.margin = margin(1, 10, 1, 1),
+        panel.border = element_blank(), panel.grid = element_blank(),
+        axis.line.x = element_line(color = 'black'))
+
+ggplot(sonoma_edbyrace) + 
+  geom_bar(aes(x = factor(race, levels = census_race_labels[7:1]), y = estimate, 
+               fill = factor(education, levels = unique(education)[c(1,4,2,3)])), 
+           stat = 'identity', position = 'fill') + 
+  scale_y_continuous(name = 'Population Proportion', expand = c(0, 0)) + 
+  scale_fill_brewer(palette = 'Purples', direction = 1, name = 'Educational Attainment',
+                    guide = guide_legend(reverse = TRUE)) + 
+  ggtitle('Race by Educational Attainment in Sonoma County', 
+          subtitle = 'Population 25 Years and Older') + 
+  coord_flip() + 
+  theme(legend.position = 'bottom', legend.direction = 'vertical',
+        axis.title.y = element_blank(),
+        plot.margin = margin(1, 10, 1, 1),
+        panel.border = element_blank(), panel.grid = element_blank(),
+        axis.line.x = element_line(color = 'black'))
+
+
+```
+
+
+2. An estimate of the number and percentage of K-12 students who have no internet access at home, using the latest available PUMS data. (Note that 2019 1-yr PUMS data will be available in mid-October 2020, so you might choose to update your analysis using that data at that time.) State your assumptions clearly, especially how useful the available data is for understanding the challenges of remote learning in 2020. Include a map of this metric for all PUMAs in the Bay Area.
+
+```{r}
+## get data
+pums_vars_2019 <- pums_variables %>% filter(year == 2019, survey == "acs1")
+
+# pums_vars_2019 %>% 
+#   distinct(var_code, var_label, data_type, level) %>%
+#   filter(grepl("internet", str_to_lower(var_label))) %>% View
+# pums_vars_2019 %>% 
+#   filter(var_code %in% c('PUMA', 'SCHG', 'FACCESSP')) %>% View
+
+ca_pumas <- pumas("CA", cb = TRUE, class = 'sf', progress = FALSE)
+bay_pumas <- ca_pumas %>% 
+  st_centroid %>% 
+  .[bay_counties, ] %>% 
+  st_drop_geometry %>% 
+  left_join(ca_pumas %>% select(GEOID10)) %>% 
+  st_as_sf()
+
+# pums_internet_flag <- 
+#   get_pums(variables = c('PUMA', 'FACCESSP', 'FHISPEEDP', 'FOTHSVCEXP', 'FSATELLITEP'),
+#            state = 'CA', year = 2019, survey = 'acs1')
+# pums_students <- 
+#   get_pums(variables = 'SCHG', 
+#            state = 'CA', year = 2019, survey = 'acs1')
+# save(pums_internet_flag, pums_students, 
+#      file = 'C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/cee218x/pums_sonoma.Rdata')
+load('C:/Users/cbowers/OneDrive/classes/CEE218X future of the bay area/cee218x/pums_sonoma.Rdata')
+
+bay_data <- pums_internet_flag %>% 
+  select(SERIALNO, SPORDER, WGTP, PWGTP, PUMA, FACCESSP, FHISPEEDP, FOTHSVCEXP, FSATELLITEP) %>% 
+  full_join(pums_students %>% select(SERIALNO, SPORDER, SCHG), by = c('SERIALNO', 'SPORDER')) %>% 
+  filter(!grepl('GQ', SERIALNO)) %>% 
+  filter(!grepl('bb', SCHG)) %>% 
+  mutate(SCHG = toNumber(SCHG), 
+         FACCESSP = toNumber(FACCESSP),
+         PUMA = toNumber(PUMA)) %>% 
+  filter(SCHG >= 2 & SCHG <= 14) %>% 
+  filter(PUMA %in% toNumber(bay_pumas$PUMACE10))
+
+bay.sf <- bay_data %>% 
+  group_by(PUMA) %>% 
+  summarize(pop = sum(PWGTP),
+            internet = (FACCESSP == 1 | FHISPEEDP == 1 | FOTHSVCEXP == 1 | FSATELLITEP == 1),
+            pop_with_internet = sum(PWGTP*internet), 
+            internet_pct = pop_with_internet/pop,
+            .groups = 'drop') %>% 
+  full_join(bay_pumas %>% mutate(PUMA = toNumber(PUMACE10)), ., by = 'PUMA')
+ggplot() + 
+  geom_sf(data = bay.sf, aes(fill = internet_pct)) + 
+  geom_sf(data = ca_pumas, fill = NA, color = 'grey80') +
+  geom_sf(data = california, fill = NA, color = 'grey50') + 
+  ggtitle('K-12 Students with Internet Access', subtitle = 'Percentage by PUMA') + 
+  scale_fill_distiller(name = element_blank(), palette = 'Blues', 
+                       label = percent, direction = 1) + 
+  coord_sf(xlim = c(-123.6, -121.2), ylim = c(36.8, 38.9)) + theme_void()
+
+```
+
+
+3. A migration analysis, as demonstrated in 2.3, using data on educational attainment. Discuss what you believe can be interpreted from the results of this methodology, especially as it relates to the “educational mobility” of Bay Area residents.
+
+```{r}
+## get data
+# acs_vars_2019_1yr %>%
+#   filter(grepl('B07009', group)) %>% View
+
+## measure people who remained + inflow
+mobility_current_2019 <- 
+  getCensus(name = "acs/acs1", vintage = 2019, vars = c("group(B07009)"),
+            regionin = "state:06", region = "county:097") %>% 
+  select(-c(GEO_ID, state, NAME)) %>%
+  select(-ends_with('EA'), -ends_with('M'), -ends_with('MA')) %>% 
+  pivot_longer(ends_with("E"), names_to = "variable", values_to = "estimate") %>%
+  left_join(acs_vars_2019_1yr %>% select(name, label), by = c("variable" = "name")) %>% 
+  select(-variable) %>% 
+  separate(label, into = c(NA, NA, 'mobility', 'education'), sep = "!!") %>% 
+  mutate(mobility = gsub(":", "", mobility), education = gsub(":", "", education)) %>% 
+  filter(!is.na(mobility) & !is.na(education)) %>% 
+  mutate(mobility = ifelse(mobility %in% c("Same house 1 year ago", "Moved within same county"),
+                           "here since last year", "inflow")) %>% 
+  group_by(mobility, education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop')
+
+## measure people who remained + outflow
+mobility_lastyear_2019 <- 
+  getCensus(name = "acs/acs1", vintage = 2019, vars = c("group(B07409)"),
+            regionin = "state:06", region = "county:097") %>% 
+  select(-c(GEO_ID, state, NAME)) %>%
+  select(-ends_with('EA'), -ends_with('M'), -ends_with('MA')) %>%
+  pivot_longer(ends_with("E"), names_to = "variable", values_to = "estimate") %>%
+  left_join(acs_vars_2019_1yr %>% select(name, label), by = c("variable" = "name")) %>% 
+  select(-variable) %>% 
+  separate(label, into = c(NA, NA, 'mobility', 'education'), sep = "!!") %>% 
+  mutate(mobility = gsub(":", "", mobility), education = gsub(":", "", education)) %>% 
+  filter(!is.na(mobility) & !is.na(education)) %>% 
+  mutate(mobility = ifelse(mobility %in% c("Same house", "Moved within same county"),
+                           "here since last year", "outflow")) %>% 
+  group_by(mobility, education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop')
+
+## check datasets
+sum(mobility_current_2019$estimate[mobility_current_2019$mobility == 'here since last year']) == 
+  sum(mobility_lastyear_2019$estimate[mobility_lastyear_2019$mobility == 'here since last year'])
+
+```
+
+```{r}
+## compare to last year's population
+mobility_current_2018 <- 
+  getCensus(name = "acs/acs1", vintage = 2018, vars = c("group(B07009)"),
+            regionin = "state:06", region = "county:097") %>% 
+  select(-c(GEO_ID, state, NAME)) %>%
+  select(-ends_with('EA'), -ends_with('M'), -ends_with('MA')) %>%
+  pivot_longer(ends_with("E"), names_to = "variable", values_to = "estimate") %>%
+  left_join(acs_vars_2019_1yr %>% select(name, label), by = c("variable" = "name")) %>% 
+  select(-variable) %>% 
+  separate(label, into = c(NA, NA, 'mobility', 'education'), sep = "!!") %>% 
+  mutate(mobility = gsub(":", "", mobility), education = gsub(":", "", education)) %>% 
+  filter(!is.na(mobility) & !is.na(education)) %>% 
+  mutate(mobility = "here last year") %>% 
+  group_by(mobility, education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop')
+
+sonoma_flows_2019 <-
+  rbind(mobility_current_2018, 
+        mobility_lastyear_2019 %>% filter(mobility == "outflow"),
+        mobility_current_2019 %>% filter(mobility == "inflow")) %>% 
+  as.data.frame %>% 
+  rbind(mobility_current_2019 %>% 
+          group_by(education) %>% 
+          summarize(estimate = sum(estimate), .groups = 'drop') %>% 
+          mutate(mobility = 'here this year') %>% 
+          select(mobility, education, estimate)) %>%
+  pivot_wider(names_from = mobility, values_from = estimate) %>% 
+  mutate(`external net` = inflow - outflow,
+         `internal net` = `here this year` - `here last year` - `external net`)
+
+## external net = inflow - outflow
+## internal net = births, deaths, etc.
+
+ggplot(sonoma_flows_2019 %>% 
+         pivot_longer(cols = c('outflow', 'inflow'), names_to = 'change', values_to = 'estimate') %>% 
+         mutate(estimate = ifelse(change == 'outflow', -estimate, estimate),
+                `external net` = ifelse(change == 'outflow', `external net`, 0))) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(aes(x = factor(education, levels = unique(education)[c(2,1,5,3,4)]), 
+               y = estimate, group = change, fill = change), stat = 'identity', color = 'grey50') + 
+  geom_bar(aes(x = factor(education, levels = unique(education)[c(2,1,5,3,4)]), 
+               y = `external net`, fill = 'net'), stat = 'identity', color = 'grey25', alpha = 0.5) + 
+  scale_fill_manual(values = c('grey95', 'grey80', 'black'), 
+                    breaks = c('inflow', 'outflow', 'net'),
+                    labels = c('Inflow', 'Outflow', 'Net')) + 
+  scale_y_continuous(breaks = seq(-4e3, 4e3, 2e3), labels = comma) + 
+  guides(fill = guide_legend(override.aes = list(alpha = c(1, 1, 0.45)))) +
+  ggtitle('Population Change in Sonoma County, 2018-2019',
+          subtitle = 'Population 25 Years and Older') + 
+  labs(y = 'Number of People', fill = 'External Flux') + 
+  geom_text(data = sonoma_flows_2019,
+            aes(x = factor(education, levels = unique(education)[c(2,1,5,3,4)]),
+                y = `external net` + 450*sign(`external net`), 
+                label = format(`external net`, big.mark = ',')),
+            size = 3.25, color = 'grey25') + 
+  theme(panel.border = element_blank(),
+        axis.line.x = element_line(color = 'black'),
+        panel.grid.major.y = element_line(color = 'grey95', linetype = 'dashed'),
+        axis.title.y = element_blank()) + 
+  coord_flip()
+
+```
+
+```{r}
+## get the total population by education level
+sonoma_ed_2019 <- 
+  getCensus(name = "acs/acs1", vintage = 2019, vars = 'group(B15002)',
+            regionin = "state:06", region = "county:097") %>%
+  select(-c(GEO_ID, state, county, NAME)) %>% 
+  select(-ends_with('EA'), -ends_with('M'), -ends_with('MA')) %>%
+  pivot_longer(cols = ends_with('E'), names_to = 'variable', values_to = 'estimate') %>%
+  left_join(acs_vars_2019_1yr %>% select(name, label), by = c('variable' = 'name')) %>% 
+  select(-variable) %>% 
+  separate(label, into = c(NA, NA, "sex", "education_year"), sep = "!!") %>% 
+  filter(!is.na(education_year)) %>% 
+  mutate(education = 
+    ifelse(education_year %in% c("No schooling completed", "Nursery to 4th grade", "5th and 6th grade", 
+                                 "7th and 8th grade", "9th grade", "10th grade", "11th grade", 
+                                 "12th grade, no diploma"), 
+           "Less than high school graduate",  
+    ifelse(education_year %in% c("Some college, less than 1 year", "Some college, 1 or more years, no degree",
+                                 "Associate's degree"), 
+           "Some college or associate's degree", 
+    ifelse(education_year %in% c("Master's degree", "Professional school degree", "Doctorate degree"),
+           "Graduate or professional degree", education_year)))) %>% 
+  group_by(education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop')
+
+mobility_current_2019 %>% 
+  group_by(education) %>% 
+  summarize(estimate = sum(estimate), .groups = 'drop') %>% 
+  .$estimate == sonoma_ed_2019$estimate
+
+sonoma_flows_2019 <- sonoma_flows_2019 %>% 
+  full_join(sonoma_ed_2019 %>% rename(`total pop` = estimate), by = 'education') %>%
+  mutate(inflow_proportion = inflow/`total pop`,
+         outflow_proportion = outflow/`total pop`,
+         net_proportion = `external net`/`total pop`)
+# ggplot(sonoma_flows_2019) + 
+#   geom_bar(aes(x = factor(education, levels = unique(sonoma_flows_2019$education)[c(2,1,5,3,4)]), 
+#                y = proportion), stat = 'identity', fill = 'grey60', color = 'grey30') + 
+#   geom_hline(yintercept = 0) + 
+#   ggtitle('External Net Flow in Sonoma County, 2018-2019', 
+#           subtitle = 'Population 25 Years and Older') + 
+#   scale_y_continuous(name = 'Proportion of People', labels = percent, expand = c(0,0),
+#                      limits = c(-0.65, 0.65)/100, breaks = seq(-0.75, 0.75, 0.25)/100,
+#                      minor_breaks = seq(-0.75, 0.75, 0.25)/100) + 
+#   theme(panel.border = element_blank(),
+#         axis.line.x = element_line(color = 'black'),
+#         panel.grid.major.y = element_line(color = 'grey95', linetype = 'dashed'),
+#         axis.title.y = element_blank()) + 
+#   coord_flip()
+ggplot(sonoma_flows_2019 %>% 
+         pivot_longer(cols = c('outflow_proportion', 'inflow_proportion'), 
+                      names_to = 'change', values_to = 'prop') %>% 
+         mutate(prop = ifelse(change == 'outflow_proportion', -prop, prop))) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(aes(x = factor(education, levels = unique(education)[c(2,1,5,3,4)]), 
+               y = prop, group = change, fill = change), stat = 'identity', color = 'grey50') + 
+  geom_bar(data = sonoma_flows_2019, 
+           aes(x = factor(education, levels = unique(education)[c(2,1,5,3,4)]), 
+               y = net_proportion, fill = 'net'), stat = 'identity', color = 'grey25', alpha = 0.5) + 
+  scale_fill_manual(values = c('grey95', 'grey80', 'black'), 
+                    breaks = c('inflow_proportion', 'outflow_proportion', 'net'),
+                    labels = c('Inflow', 'Outflow', 'Net')) + 
+  scale_y_continuous(labels = percent, breaks = seq(-7.5, 7.5, 2.5)/100) +
+  guides(fill = guide_legend(override.aes = list(alpha = c(1, 1, 0.45)))) +
+  ggtitle('Population Change in Sonoma County, 2018-2019',
+          subtitle = 'Population 25 Years and Older') + 
+  labs(y = 'Proportion of People', fill = 'External Flux') + 
+  geom_text(data = sonoma_flows_2019,
+            aes(x = factor(education, levels = unique(education)[c(2,1,5,3,4)]),
+                y = net_proportion + 0.008*sign(net_proportion), 
+                label = paste0(round(net_proportion*100,2), '%')),
+            size = 3.25, color = 'grey25') + 
+  theme(panel.border = element_blank(),
+        axis.line.x = element_line(color = 'black'),
+        panel.grid.major.y = element_line(color = 'grey95', linetype = 'dashed'),
+        axis.title.y = element_blank()) + 
+  coord_flip()
+
+
+```
+
+questions:
+
+* is it ok that part (a) is county-level, not CBG-level?
+* why is my internet access so low? 
+* for B07009 & B07409, can I assume pop > 25 years old? 

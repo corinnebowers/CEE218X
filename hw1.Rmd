@@ -1,41 +1,71 @@
 ---
 title: "CEE218X Assignment #1"
 author: "Corinne Bowers"
-date: `r format(Sys.Date(), '%B %d, %Y')`
+date: "9/22/2020"
 output: html_document
 ---
 
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 10)
 
 ```
 
-```{r packages, message = FALSE, warning = FALSE}
+```{r message = FALSE, warning = FALSE}
+## load packages
 require(tidyverse); theme_set(theme_bw())
 require(foreach)
-require(plotly)
 require(sf)
 require(tigris)
 require(leaflet)
 require(lubridate)
-
-```
-
-```{r functions}
-Sum <- function(x) sum(x, na.rm = TRUE)
-toNumber <- function(x) as.numeric(paste(x))
-
-```
-
-```{r constants}
-crs_planar <- 26910 
-crs_leaflet <- 4326
+require(grid)
+require(gridExtra)
+require(scales)
+require(ggnewscale)
 
 ```
 
 ```{r}
-## load data from PG&E website
+## import useful functions
+Sum <- function(x) sum(x, na.rm = TRUE)
+Mean <- function(x) mean(x, na.rm = TRUE)
 
+toNumber <- function(x) as.numeric(paste(x))
+
+ggcolor <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+```
+
+```{r}
+## load geometries
+crs_planar <- 26910 
+crs_leaflet <- 4326
+
+bay_county_names <- c("Alameda", "Contra Costa", "Marin", "Napa", "San Francisco",
+                      "San Mateo", "Santa Clara", "Solano", "Sonoma")
+
+california <- counties(state = 'CA', cb = TRUE, progress_bar = FALSE, class = 'sf')
+bay_counties <- california %>% filter(NAME %in% bay_county_names)
+
+usa_zips <- zctas(cb = TRUE, progress_bar = FALSE, class = 'sf')
+bay_zips <- usa_zips %>%
+  st_centroid %>%
+  st_transform(crs_planar) %>% 
+  st_intersection(st_transform(bay_counties, crs_planar)) %>%
+  st_drop_geometry %>%
+  left_join(usa_zips %>% select(GEOID10)) %>%
+  st_as_sf()
+bay_zips$ZCTA5CE10 <- toNumber(bay_zips$ZCTA5CE10)
+
+```
+
+
+```{r}
+## load data from PG&E website
 col_types_elec <- cols(
   ZIPCODE = col_double(),
   MONTH = col_double(),
@@ -47,8 +77,7 @@ col_types_elec <- cols(
   AVERAGEKWH = col_number()
 )
 elec <- 
-  foreach (file = list.files('./PGE_ElectricUsageByZip'), 
-           .combine = 'rbind') %do% {
+  foreach (file = list.files('./PGE_ElectricUsageByZip'), .combine = 'rbind') %do% {
     read_csv(paste0('./PGE_ElectricUsageByZip/', file), col_types = col_types_elec)
   }
 
@@ -63,90 +92,226 @@ col_types_gas <- cols(
   AVERAGETHM = col_number()
 )
 gas <- 
-  foreach (file = list.files('./PGE_GasUsageByZip'), 
-           .combine = 'rbind') %do% {
+  foreach (file = list.files('./PGE_GasUsageByZip'), .combine = 'rbind') %do% {
     read_csv(paste0('./PGE_GasUsageByZip/', file), col_types = col_types_gas)
   }
 
 ```
 
-
 ```{r}
-## start data analysis
-bay_county_names <- c("Alameda", "Contra Costa", "Marin", "Napa", "San Francisco",
-                      "San Mateo", "Santa Clara", "Solano", "Sonoma")
-
-california <- counties(state = 'CA', cb = TRUE, progress_bar = FALSE, class = 'sf')
-bay_counties <- california %>% filter(NAME %in% bay_county_names)
-
-usa_zips <- zctas(cb = TRUE, progress_bar = FALSE, class = 'sf')
-bay_zips <- usa_zips %>% 
-  st_centroid %>% 
-  st_intersection(bay_counties) %>% 
-  st_drop_geometry %>% 
-  left_join(usa_zips %>% select(GEOID10)) %>% 
-  st_as_sf() 
-bay_zips$ZCTA5CE10 <- toNumber(bay_zips$ZCTA5CE10)
-
 ## clean up elec & gas
-kwh_kbtu <- 3412.14
-therm_kbtu <- 99976.1
+kwh_kbtu <- 3412.14/1e3
+therm_kbtu <- 99976.1/1e3
 
 elec <- elec %>% 
   subset(ZIPCODE %in% bay_zips$ZCTA5CE10) %>% 
   mutate(CUSTOMERCLASS = gsub('Elec- ', '', CUSTOMERCLASS)) %>%
   subset(CUSTOMERCLASS %in% c('Commercial', 'Residential')) %>% 
   mutate(TOTALKBTU = TOTALKWH*kwh_kbtu) %>%    
-         # AVGKBTU = AVERAGEKWH*kwh_kbtu
   select(-TOTALKWH, -AVERAGEKWH)
 gas <- gas %>% 
   subset(ZIPCODE %in% bay_zips$ZCTA5CE10) %>% 
   mutate(CUSTOMERCLASS = gsub('Gas- ', '', CUSTOMERCLASS)) %>%
   mutate(TOTALKBTU = TOTALTHM*therm_kbtu) %>% 
-         # AVGKBTU = AVERAGETHM*therm_kbtu
   select(-TOTALTHM, -AVERAGETHM)
 
-kbtu <- full_join(elec, gas, by = c('ZIPCODE', 'MONTH', 'YEAR', 'CUSTOMERCLASS'), suffix = c('_ELEC', '_GAS'))
-
-## add spatial data
-kbtu.sf <- kbtu %>%
+## combine and add spatial data
+kbtu <- full_join(elec, gas, 
+                  by = c('ZIPCODE', 'MONTH', 'YEAR', 'CUSTOMERCLASS'), 
+                  suffix = c('_ELEC', '_GAS')) %>% 
   full_join(bay_zips, ., by = c('ZCTA5CE10' = 'ZIPCODE'))
-
-temp <- kbtu.sf %>% 
-  group_by(NAME, MONTH, YEAR) %>% 
-  summarize(avg_elec = Sum(TOTALKBTU_ELEC) / Sum(TOTALCUSTOMERS_ELEC),
-            avg_gas = Sum(TOTALKBTU_GAS) / Sum(TOTALCUSTOMERS_GAS)) %>% 
-  mutate(date = ymd(paste(YEAR, MONTH, '1', sep = '-')))
-ggplot(temp) + 
-  geom_line(aes(x = date, y = avg_elec, group = NAME, color = NAME)) + 
-  ggtitle('Average Electricity Consumption by County')
-ggplot(temp) + 
-  geom_line(aes(x = date, y = avg_gas, group = NAME, color = NAME)) + 
-  ggtitle('Average Gas Consumption by County')
-
-temp <- kbtu.sf %>% 
+kbtu.plot <- kbtu %>% 
   group_by(CUSTOMERCLASS, MONTH, YEAR) %>% 
   summarize(total_elec = Sum(TOTALKBTU_ELEC),
             avg_elec = total_elec / Sum(TOTALCUSTOMERS_ELEC),
             total_gas = Sum(TOTALKBTU_GAS),
             avg_gas = total_gas / Sum(TOTALCUSTOMERS_GAS)) %>% 
+  subset(!is.na(YEAR)) %>%
   mutate(date = ymd(paste(YEAR, MONTH, '1', sep = '-')))
-ggplot(temp) + 
-  geom_line(aes(x = date, y = avg_elec, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'elec')) + 
-  geom_line(aes(x = date, y = avg_gas, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'gas')) + 
-  ggtitle('Average Consumption (KBTUs)', subtitle = 'Separated by Customer Type and Consumption Type')
-
-ggplot(temp %>% subset(YEAR >= 2019)) + 
-  geom_line(aes(x = date, y = avg_elec, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'elec')) + 
-  geom_line(aes(x = date, y = avg_gas, group = CUSTOMERCLASS, color = CUSTOMERCLASS, linetype = 'gas')) + 
-  ggtitle('Average Consumption (KBTUs)', subtitle = 'Separated by Customer Type and Consumption Type') + 
-  labs(color = 'Customer Type', linetype = 'Consumption Type', y = 'Energy Consumption (KBTUs)') + 
-  scale_x_date(date_breaks = 'months', date_minor_breaks = 'months', date_labels = '%b %g') + 
-  theme(axis.title.x = element_blank())
-
-
-?scale_x_date
-View(st_drop_geometry(kbtu.sf))
 
 ```
 
+```{r}
+## plot residential/commercial and electricity/gas vs. time
+ggplot(kbtu.plot %>% subset(!is.na(CUSTOMERCLASS))) + 
+  geom_rect(aes(ymin = 0, ymax = 60, xmin = ymd('2020-03-15'), xmax = ymd('2020-06-01')), 
+            fill = 'grey90') + 
+  geom_line(aes(x = date, y = avg_elec/1e3, 
+                group = CUSTOMERCLASS, color = CUSTOMERCLASS, 
+                linetype = 'Electricity'), size = 1) + 
+  geom_line(aes(x = date, y = avg_gas/1e3, 
+                group = CUSTOMERCLASS, color = CUSTOMERCLASS, 
+                linetype = 'Gas'), size = 1) + 
+  ggtitle('Average Energy Consumption', subtitle = 'Separated by Customer Type and Consumption Type') + 
+  labs(color = 'Customer Type', linetype = 'Consumption Type', y = 'Energy Consumption (Thousand KBTUs)') + 
+  scale_x_date(date_breaks = '6 month', date_minor_breaks = 'month', date_labels = '%b %g',
+               expand = c(0.01, 0.01)) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  theme_classic() + theme(axis.title.x = element_blank())
+
+```
+
+In this first plot we see average energy consumption for the nine Bay Area counties, in thousands of BTUs per capita. The energy consumption is separated out by residential vs. commercial and by electricity vs. gas. The shaded area represents the period of the coronavirus lockdown in the Bay, from mid-March to current. It seems like commercial electricity usage may have dropped due to the virus. However, it is hard to distinguish any trends in either commercial or residential gas usage because the seasonal trend is so strong, and the magnitude of the residential electricity usage is so small compared to the other usage categories that the variations are not clear. Let's look at these individually to see if any additional patterns appear.
+
+```{r}
+## compare 2020 monthly performance to other years
+months <- c('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+g1 <- ggplot(kbtu.plot %>% subset(CUSTOMERCLASS == 'Residential')) + 
+  geom_line(aes(x = MONTH, y = avg_elec/1e3, group = factor(YEAR), 
+                color = (YEAR == 2020), size = (YEAR == 2020)), show.legend = FALSE) + 
+  ggtitle(label = waiver(), subtitle = 'Residential Electricity') + 
+  scale_x_continuous(breaks = 1:12, minor_breaks = 1:12, labels = substr(months, 1, 1)) + 
+  scale_color_manual(values = c('grey25', 'red')) + 
+  scale_size_manual(values = c(0.25, 1)) + 
+  theme_classic() + theme(axis.title = element_blank())
+g2 <- ggplot(kbtu.plot %>% subset(CUSTOMERCLASS == 'Residential')) + 
+  geom_line(aes(x = MONTH, y = avg_gas/1e3, group = factor(YEAR), 
+                color = (YEAR == 2020), size = (YEAR == 2020)), show.legend = FALSE) + 
+  ggtitle(label = waiver(), subtitle = 'Residential Gas') + 
+  scale_x_continuous(breaks = 1:12, minor_breaks = 1:12, labels = substr(months, 1, 1)) + 
+  scale_color_manual(values = c('grey25', 'red')) + 
+  scale_size_manual(values = c(0.25, 1)) + 
+  theme_classic() + theme(axis.title = element_blank())
+g3 <- ggplot(kbtu.plot %>% subset(CUSTOMERCLASS == 'Commercial')) + 
+  geom_line(aes(x = MONTH, y = avg_elec/1e3, group = factor(YEAR), 
+                color = (YEAR == 2020), size = (YEAR == 2020)), show.legend = FALSE) + 
+  ggtitle(label = waiver(), subtitle = 'Commercial Electricity') + 
+  scale_x_continuous(breaks = 1:12, minor_breaks = 1:12, labels = substr(months, 1, 1)) + 
+  scale_color_manual(values = c('grey25', 'red')) + 
+  scale_size_manual(values = c(0.25, 1)) + 
+  theme_classic() + theme(axis.title = element_blank())
+g4 <- ggplot(kbtu.plot %>% subset(CUSTOMERCLASS == 'Commercial')) + 
+  geom_line(aes(x = MONTH, y = avg_gas/1e3, group = factor(YEAR), 
+                color = (YEAR == 2020), size = (YEAR == 2020)), show.legend = FALSE) + 
+  ggtitle(label = waiver(), subtitle = 'Commercial Gas') + 
+  scale_x_continuous(breaks = 1:12, minor_breaks = 1:12, labels = substr(months, 1, 1)) + 
+  scale_color_manual(values = c('grey25', 'red')) + 
+  scale_size_manual(values = c(0.25, 1)) + 
+  theme_classic() + theme(axis.title = element_blank())
+grid.arrange(g1, g2, g3, g4, nrow = 2, clip = 'off',
+             top = textGrob('Monthly Energy Consumption by Year', 
+                            vjust = 0.5, gp = gpar(cex = 1.1)),
+             left = textGrob('Energy Consumption (Thousand KBTUs)', rot = 90, vjust = 0), 
+             bottom = textGrob('Month', vjust = 0))
+
+```
+
+In this plot, the grey lines indicate monthly consumption values from 2017 through 2019, where each year is represented by a single line. The red lines indicate monthly consumption values so far for 2020. We can confirm our initial hypothesis about commercial electricity usage. While January and February of 2020 resembled previous years, consumption dropped off sharply through March and April, then showed weak signs of recovery in May and June. In addition, new patterns have emerged that were not visible in the larger time series graph. For example we can see that commercial gas usage has also dropped, even though it is not quite as dramatic as electricity. January and February had unusually high levels of commercial gas consumption, March saw a transition, and then April onwards have had unusually low levels.
+
+With a decrease in commercial energy consumption, we would expect to see a corresponding increase in residential energy consumption due to the coronavirus. This is somewhat visible in the signature of residential electricity usage. January and February were relatively low compared to the three previous years, then consumption rose to unusually high levels for March onwards. However, the spring appears to be a seasonal low point for residential electricity, so it will be interesting to see if consumption stays higher than normal through the summer as well. Interestingly there seems to be no effect of coronavirus on residential gas consumption. 
+
+```{r}
+## create maps of consumption
+kbtu.map <- kbtu %>% 
+  group_by(ZIP = ZCTA5CE10, CUSTOMERCLASS, MONTH, YEAR) %>% 
+  summarize(total_elec = Sum(TOTALKBTU_ELEC),
+            avg_elec = total_elec / Sum(TOTALCUSTOMERS_ELEC),
+            total_gas = Sum(TOTALKBTU_GAS),
+            avg_gas = total_gas / Sum(TOTALCUSTOMERS_GAS)) %>% 
+  subset(!is.na(MONTH)) %>% 
+  mutate(date = ymd(paste(YEAR, MONTH, '1', sep = '-'))) %>% 
+  subset(MONTH == 4) %>% 
+  ungroup %>% 
+  select(ZIP, YEAR, CUSTOMERCLASS, total_elec) %>% 
+  st_drop_geometry %>%
+  pivot_wider(names_from = YEAR, values_from = total_elec) %>% 
+  full_join(bay_zips %>% select(ZIP = ZCTA5CE10), ., by = 'ZIP') %>% 
+  setNames(make.names(names(.))) %>% 
+  mutate(absolute_diff = X2020 - X2019, 
+         percent_diff = ifelse(
+           X2019 == 0 & X2020 == 0, 0, 
+           ifelse(X2019 == 0 & X2020 > 0, 1, (X2020 - X2019)/X2019)))
+
+kbtu.map.res <- kbtu.map %>% 
+  subset(CUSTOMERCLASS == 'Residential')
+kbtu.map.comm <- kbtu.map %>% 
+  subset(CUSTOMERCLASS == 'Commercial')
+
+```
+
+```{r}
+## plot percent change in consumption from April 2019 to April 2020
+g.res <- ggplot() + 
+  geom_sf(data = california, fill = 'grey95') + 
+  geom_sf(data = kbtu.map.res, aes(fill = percent_diff), color = NA) + 
+  scale_fill_gradient2(name = 'Change', labels = percent,
+                       low = 'darkred', high = 'blue2',
+                       limits = c(-1, 1), na.value = NA) +
+  geom_sf(data = california, fill = NA) + 
+  ggtitle('Residential') +
+  lims(x = c(-123.5, -121.33), y = c(36.75, 39)) + 
+  theme_void()
+g.comm <- ggplot() + 
+  geom_sf(data = california, fill = 'grey95') + 
+  geom_sf(data = kbtu.map.comm, 
+          aes(fill = percent_diff), color = NA) + 
+  scale_fill_gradient2(name = 'Change', labels = percent, 
+                       low = 'darkred', high = 'blue2',
+                       limits = c(-1, 1), na.value = NA) + 
+  ggnewscale::new_scale_fill() + 
+  geom_sf(data = kbtu.map.comm %>% subset(percent_diff > 1), aes(fill = '>100%'), color = NA) +
+  scale_fill_manual(name = '', values = 'blue4') + 
+  geom_sf(data = california, fill = NA) + 
+  ggtitle('Commercial') +
+  lims(x = c(-123.5, -121.33), y = c(36.75, 39)) + 
+  theme_void()
+grid.arrange(g.res, g.comm, ncol = 2, 
+             top = textGrob('Percent Change in Electricity Consumption, April 2019 -- April 2020', 
+                            vjust = 0.5, gp = gpar(cex = 1.1)))
+
+```
+
+These two maps compare the percentage change in residential (left) and commercial (right) electricity consumption from April 2019 to April 2020, the first month spent entirely in lockdown due to the coronavirus. In the residential map, we see a moderate increase in total electricity consumption distributed relatively evenly throughout the nine counties of the Bay Area. The average percent change is `r round(Mean(kbtu.map.res$percent_diff)*100, 2)`%, or about `r formatC(mean(kbtu.map.res$absolute_diff, na.rm = TRUE), digits = 7, big.mark = ',')` extra KBTUs per zip code. Only a handful of zip codes saw a decrease in residential energy usage, which can be seen more clearly in the interactive leaflet below. They are all along the Pacific coastline north of Point Reyes, which is not a very populated area and could be skewed as a result.
+
+The map of commercial electricity consumption, on the other hand, has a lot more variation. `r round(sum(kbtu.map.comm$absolute_diff == 0)/nrow(kbtu.map.comm)*100, 2)`% of zip codes had no commercial electricity consumption reported in either year, so these are shown as white. Zip codes with zero consumption in April 2019 and nonzero consumption in April 2020 were said to have 100% percent change. Conversely, zip codes with nonzero consumption in April 2019 and zero consumption in April 2020 were said to have -100% percent change. A handful of zip codes even had a percent change greater than 100%, which are displayed separately from the gradient scale. Apart from these outliers, the general trend seems to be a moderate regional decrease in commercial electricity consumption. The average percent change is `r round(mean(kbtu.map.comm$percent_diff)*100,2)`%, or about `r formatC(abs(mean(kbtu.map.comm$absolute_diff, na.rm = TRUE)), digits = 7, big.mark = ',')` fewer KBTUs per zip code. The places with large swings in commercial energy consumption are scattered throughout the Bay Area without a clear pattern. One possible explanation may be that these locations represent concentrations of specific industries that responded to the coronavirus in different ways, but more exploration would be necessary to confirm or refute that hypothesis.
+
+```{r}
+## make the percent change maps interactive
+domain <- c(-100, 100)
+colorPal <- c(colorRampPalette(colors = c("#b2182b", "white"), space = "Lab")(100),
+              colorRampPalette(colors = c("white", "#2166ac"), space = "Lab")(100))
+
+leaflet() %>% 
+  addTiles() %>% 
+  addPolygons(data = kbtu.map.res %>% 
+                subset(percent_diff != 0) %>% 
+                mutate(percent_diff = 100*percent_diff) %>% 
+                st_transform(crs_leaflet), 
+              color = 'gray', weight = 1,
+              fillColor = ~get('colorBin')(colorPal, domain)(percent_diff), 
+              fillOpacity = 0.9,
+              label = ~paste0(ZIP, ": ", round(percent_diff,2), '%')) %>% 
+  addPolygons(data = kbtu.map.res %>% 
+                subset(percent_diff == 0) %>% 
+                mutate(percent_diff = 100*percent_diff) %>% 
+                st_transform(crs_leaflet), 
+              color = 'gray', weight = 1,
+              fillColor = 'white', 
+              fillOpacity = 0.9,
+              label = ~paste0(ZIP, ": ", round(percent_diff,2), '%')) %>% 
+  addLegend("topright", 
+            pal = colorBin(colorPal, domain = domain), 
+            values = domain, opacity = 0.9)
+leaflet() %>% 
+  addTiles() %>% 
+  addPolygons(data = kbtu.map.comm %>% 
+                subset(percent_diff != 0) %>% 
+                mutate(percent_diff = 100*percent_diff) %>% 
+                st_transform(crs_leaflet), 
+              color = 'gray', weight = 1,
+              fillColor = ~get('colorBin')(colorPal, domain)(percent_diff), 
+              fillOpacity = 0.9, 
+              label = ~paste0(ZIP, ": ", round(percent_diff,2), '%')) %>% 
+  addPolygons(data = kbtu.map.comm %>% 
+                subset(percent_diff == 0) %>% 
+                mutate(percent_diff = 100*percent_diff) %>% 
+                st_transform(crs_leaflet), 
+              color = 'gray', weight = 1,
+              fillColor = 'white', 
+              fillOpacity = 0.9,
+              label = ~paste0(ZIP, ": ", round(percent_diff,2), '%')) %>% 
+  addLegend("topright", 
+            pal = colorBin(colorPal, domain = domain), 
+            values = domain, opacity = 0.9)
+
+```
